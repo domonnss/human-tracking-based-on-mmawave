@@ -8,32 +8,95 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Ellipse
 import matplotlib.transforms as transforms
 from sklearn.metrics.pairwise import euclidean_distances
+from filterpy.kalman import KalmanFilter
+import math
 
 class Track:
-    """单个轨迹类，存储轨迹的状态和历史信息"""
-
     def __init__(self, track_id, initial_center, timestamp, max_history=30):
         self.track_id = track_id
-        self.centers = [initial_center]  # 存储历史中心点 [x,y,z]
+        self.centers = [initial_center]  # 存储历史中心点 [x,y] 或 [x,y,z]
         self.timestamps = [timestamp]    # 对应的时间戳
         self.max_history = max_history   # 最大历史记录长度
         self.age = 1                     # 轨迹存在的帧数
         self.invisible_count = 0         # 连续未检测到的帧数
-        self.velocity = np.zeros(3)      # 速度估计 [vx,vy,vz]
+        self.velocity = np.zeros(len(initial_center))  # 速度估计，维度与中心点一致
         self.predicted_center = None     # 预测的下一个中心位置
         self.color = None                # 轨迹颜色
         self.is_active = True            # 轨迹是否活跃
 
-    def update(self, new_center, timestamp):
-        """更新轨迹状态"""
-        # 计算速度
-        if len(self.centers) > 0:
-            time_diff = (timestamp - self.timestamps[-1]).total_seconds()
-            if time_diff > 0:
-                self.velocity = (new_center - self.centers[-1]) / time_diff
+        # 判断输入数据的维度
+        self.dim = len(initial_center)  # 数据维度（2D或3D）
 
-        # 添加新的中心点和时间戳
-        self.centers.append(new_center)
+        # 初始化KF（使用KalmanFilter而不是ExtendedKalmanFilter，因为是线性系统）
+        self.kf = KalmanFilter(dim_x=2*self.dim, dim_z=self.dim)
+
+        # 状态向量 [x, y, vx, vy] 或 [x, y, z, vx, vy, vz]
+        initial_state = np.zeros(2*self.dim)
+        initial_state[:self.dim] = initial_center
+        self.kf.x = initial_state
+
+        # 状态转移矩阵 (F)
+        self.kf.F = np.eye(2*self.dim)
+        # 位置更新依赖于速度
+        self.dt = 0.1  # 默认时间步长，将在update中更新
+        self._update_F()
+
+        # 测量矩阵 (H) - 我们只测量位置, 不测量速度
+        self.kf.H = np.zeros((self.dim, 2*self.dim))
+        for i in range(self.dim):
+            self.kf.H[i, i] = 1.0
+
+        # 测量噪声协方差 (R)
+        self.kf.R = np.eye(self.dim) * 0.1  # 位置测量的噪声
+
+        # 过程噪声协方差 (Q)
+        self.kf.Q = np.eye(2*self.dim)
+        self.kf.Q[:self.dim, :self.dim] *= 0.01  # 位置过程噪声
+        self.kf.Q[self.dim:, self.dim:] *= 0.1   # 速度过程噪声
+
+        # 状态协方差矩阵 (P)
+        self.kf.P = np.eye(2*self.dim)
+        self.kf.P[:self.dim, :self.dim] *= 1.0     # 位置的初始不确定性
+        self.kf.P[self.dim:, self.dim:] *= 10.0    # 速度的初始不确定性
+
+    def _update_F(self):
+        """更新状态转移矩阵F，考虑时间步长"""
+        for i in range(self.dim):
+            self.kf.F[i, i+self.dim] = self.dt
+
+    def update(self, new_center, timestamp):
+        """使用KF更新轨迹状态"""
+        # 检查新中心点的维度是否与当前维度一致
+        if len(new_center) != self.dim:
+            # 如果不一致，调整中心点
+            if len(new_center) < self.dim:
+                # 扩展维度（例如从2D扩展到3D）
+                new_center = np.append(new_center, [0] * (self.dim - len(new_center)))
+            else:
+                # 截断维度（例如从3D截断到2D）
+                new_center = new_center[:self.dim]
+
+        # 计算时间差
+        if len(self.timestamps) > 0:
+            self.dt = (timestamp - self.timestamps[-1]).total_seconds()
+            if self.dt <= 0:  # 防止时间差为零或负值
+                self.dt = 0.1
+
+        # 更新状态转移矩阵
+        self._update_F()
+
+        # 预测步骤
+        self.kf.predict()
+
+        # 更新步骤（校正）
+        self.kf.update(new_center)
+
+        # 从KF获取速度估计
+        self.velocity = self.kf.x[self.dim:2*self.dim]
+
+        # 添加新的中心点（使用校正后的位置）和时间戳
+        corrected_center = self.kf.x[:self.dim]
+        self.centers.append(corrected_center)
         self.timestamps.append(timestamp)
 
         # 如果超过最大历史长度，移除最旧的记录
@@ -46,7 +109,7 @@ class Track:
         self.is_active = True
 
     def predict(self, timestamp=None):
-        """预测下一个位置"""
+        """使用KF预测下一个位置"""
         if len(self.centers) < 2:
             self.predicted_center = self.centers[-1]
             return self.predicted_center
@@ -60,9 +123,25 @@ class Track:
         else:
             # 使用指定时间戳进行预测
             prediction_time = (timestamp - self.timestamps[-1]).total_seconds()
+            if prediction_time <= 0:  # 防止时间差为零或负值
+                prediction_time = 0.1
 
-        # 线性预测
-        self.predicted_center = self.centers[-1] + self.velocity * prediction_time
+        # 保存当前状态
+        x_current = self.kf.x.copy()
+        F_current = self.kf.F.copy()
+
+        # 临时更新时间步长并预测
+        self.dt = prediction_time
+        self._update_F()
+        self.kf.predict()
+
+        # 获取预测结果
+        self.predicted_center = self.kf.x[:self.dim].copy()
+
+        # 恢复KF到原始状态
+        self.kf.x = x_current
+        self.kf.F = F_current
+
         return self.predicted_center
 
     def mark_invisible(self):
